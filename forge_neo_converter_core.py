@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import struct
 import tempfile
 import time
 from collections import Counter, OrderedDict
@@ -268,11 +269,149 @@ def iter_streaming_input(path, plan):
             yield key, tensor
 
 
+def _safetensors_dtype_name(dtype):
+    names = {
+        torch.float64: "F64", torch.float32: "F32", torch.float16: "F16",
+        torch.bfloat16: "BF16", torch.int64: "I64", torch.int32: "I32",
+        torch.int16: "I16", torch.int8: "I8", torch.uint8: "U8", torch.bool: "BOOL",
+    }
+    if hasattr(torch, "uint64"):
+        names[torch.uint64] = "U64"
+    if hasattr(torch, "uint32"):
+        names[torch.uint32] = "U32"
+    if hasattr(torch, "uint16"):
+        names[torch.uint16] = "U16"
+    for attr, name in (
+        ("float8_e4m3fn", "F8_E4M3"),
+        ("float8_e5m2", "F8_E5M2"),
+        ("float8_e4m3fnuz", "F8_E4M3FNUZ"),
+        ("float8_e5m2fnuz", "F8_E5M2FNUZ"),
+    ):
+        dtype_value = getattr(torch, attr, None)
+        if dtype_value is not None:
+            names[dtype_value] = name
+    try:
+        return names[dtype]
+    except KeyError as error:
+        raise ValueError(f"Unsupported safetensors dtype: {dtype}") from error
+
+
+class StreamingSafeTensorWriter:
+    """Write tensors incrementally without retaining the converted state dict in RAM."""
+
+    COPY_CHUNK_SIZE = 8 * 1024 * 1024
+    MAX_HEADER_SIZE = 100_000_000
+
+    def __init__(self, output_path, log=_noop_logger):
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        output_name = os.path.basename(output_path)
+        self.payload_path = os.path.join(output_dir, f".{output_name}.payload.partial")
+        self.entries = OrderedDict()
+        self.offset = 0
+        self.log = log
+        self._payload = open(self.payload_path, "wb")
+
+    def __setitem__(self, key, tensor):
+        if key in self.entries:
+            raise RuntimeError(f"Duplicate output tensor key: {key}")
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"Output tensor '{key}' is not a torch.Tensor.")
+        if tensor.layout != torch.strided:
+            raise ValueError(f"Output tensor '{key}' is not dense.")
+        cpu_tensor = tensor.detach()
+        if cpu_tensor.device.type != "cpu":
+            cpu_tensor = cpu_tensor.cpu()
+        if not cpu_tensor.is_contiguous():
+            cpu_tensor = cpu_tensor.contiguous()
+
+        dtype_name = _safetensors_dtype_name(cpu_tensor.dtype)
+        shape = [int(dim) for dim in cpu_tensor.shape]
+        byte_view = cpu_tensor.view(torch.uint8)
+        data_view = memoryview(byte_view.numpy())
+        begin = self.offset
+        end = begin + data_view.nbytes
+        self._payload.write(data_view)
+        self.entries[key] = {
+            "dtype": dtype_name,
+            "shape": shape,
+            "data_offsets": [begin, end],
+        }
+        self.offset = end
+        del data_view, byte_view, cpu_tensor
+
+    def _build_header(self, metadata):
+        header = OrderedDict()
+        if metadata:
+            header["__metadata__"] = {
+                str(key): str(value) for key, value in metadata.items()
+            }
+        header.update(self.entries)
+        header_bytes = json.dumps(
+            header, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        aligned_size = (len(header_bytes) + 7) // 8 * 8
+        header_bytes += b" " * (aligned_size - len(header_bytes))
+        if aligned_size > self.MAX_HEADER_SIZE:
+            raise RuntimeError(f"Safetensors header is too large: {aligned_size} bytes.")
+        return struct.pack("<Q", aligned_size) + header_bytes
+
+    def finalize(self, output_path, metadata):
+        if self._payload is None:
+            raise RuntimeError("Streaming safetensors writer is already closed.")
+        self._payload.flush()
+        self._payload.close()
+        self._payload = None
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        output_name = os.path.basename(output_path)
+        temp_path = os.path.join(output_dir, f".{output_name}.partial")
+        try:
+            header = self._build_header(metadata)
+            self.log(
+                f"Finalizing streaming output: {output_name} "
+                f"({len(self.entries)} tensors, {self.offset} payload bytes)"
+            )
+            with open(temp_path, "wb") as destination:
+                destination.write(header)
+                with open(self.payload_path, "rb") as payload:
+                    while True:
+                        chunk = payload.read(self.COPY_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            _validate_saved_safetensors(temp_path, self, metadata)
+            os.replace(temp_path, output_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError as error:
+                    self.log(f"Warning: could not remove temporary output '{temp_path}': {error}")
+            if self.payload_path and os.path.exists(self.payload_path):
+                try:
+                    os.remove(self.payload_path)
+                except OSError as error:
+                    self.log(f"Warning: could not remove temporary payload '{self.payload_path}': {error}")
+            self.payload_path = None
+
+
 def _validate_saved_safetensors(path, tensors, metadata):
     if os.path.getsize(path) <= 0:
         raise RuntimeError("Saved safetensors file is empty.")
 
-    expected_keys = set(tensors)
+    if isinstance(tensors, StreamingSafeTensorWriter):
+        expected_specs = tensors.entries
+    else:
+        expected_specs = OrderedDict(
+            (key, {
+                "dtype": _safetensors_dtype_name(value.dtype),
+                "shape": [int(dim) for dim in value.shape],
+            })
+            for key, value in tensors.items()
+        )
+
+    expected_keys = set(expected_specs)
     with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
         saved_keys = set(handle.keys())
         if saved_keys != expected_keys:
@@ -282,38 +421,35 @@ def _validate_saved_safetensors(path, tensors, metadata):
                 f"Saved safetensors keys do not match output. Missing: {missing}; "
                 f"extra: {extra}."
             )
-
-        for key, expected in tensors.items():
+        for key, expected in expected_specs.items():
             saved = handle.get_tensor(key)
-            if saved.dtype != expected.dtype or tuple(saved.shape) != tuple(expected.shape):
+            actual_dtype = _safetensors_dtype_name(saved.dtype)
+            if actual_dtype != expected["dtype"] or tuple(saved.shape) != tuple(expected["shape"]):
                 raise RuntimeError(
                     f"Saved tensor '{key}' does not match output: expected "
-                    f"{expected.dtype} {tuple(expected.shape)}, got "
-                    f"{saved.dtype} {tuple(saved.shape)}."
+                    f"{expected['dtype']} {tuple(expected['shape'])}, got "
+                    f"{actual_dtype} {tuple(saved.shape)}."
                 )
-
         saved_metadata = handle.metadata() or {}
 
-    expected_metadata = dict(metadata or {})
-    if saved_metadata != expected_metadata:
+    if saved_metadata != dict(metadata or {}):
         raise RuntimeError("Saved safetensors metadata does not match output metadata.")
 
 
 def save_safetensors_atomic(tensors, output_path, metadata, log=_noop_logger):
-    """Validate a same-directory temporary file before atomically replacing output."""
+    """Save atomically; large streaming outputs are written incrementally."""
+    if isinstance(tensors, StreamingSafeTensorWriter):
+        tensors.finalize(output_path, metadata)
+        return
+
     output_dir = os.path.dirname(os.path.abspath(output_path))
     output_name = os.path.basename(output_path)
     temp_path = None
-
     try:
         with tempfile.NamedTemporaryFile(
-            dir=output_dir,
-            prefix=f".{output_name}.",
-            suffix=".partial",
-            delete=False,
+            dir=output_dir, prefix=f".{output_name}.", suffix=".partial", delete=False
         ) as temp_file:
             temp_path = temp_file.name
-
         log(f"Writing temporary output: {temp_path}")
         safetensors.torch.save_file(tensors, temp_path, metadata=metadata)
         _validate_saved_safetensors(temp_path, tensors, metadata)
@@ -325,7 +461,6 @@ def save_safetensors_atomic(tensors, output_path, metadata, log=_noop_logger):
                 os.remove(temp_path)
             except OSError as error:
                 log(f"Warning: could not remove temporary output '{temp_path}': {error}")
-
 
 def dequantize_input(sd, metadata, log=_noop_logger):
     quant_layers = {}
@@ -435,10 +570,10 @@ def convert_model(model_path, model_type, target_format, device, log=_noop_logge
 
     input_format = input_plan.input_format
     log(f"Original format: {input_format}")
-    log("Memory mode: streaming source tensors with per-layer dequantization")
+    log("Memory mode: streaming source tensors and output tensors to disk")
 
     quant_map = {"format_version": "1.0", "layers": {}}
-    new_sd = {}
+    new_sd = StreamingSafeTensorWriter(output_path, log=log)
     counts = Counter()
     total = len(input_plan.keys)
     mxfp8_backend = pick_mxfp8_backend(device, log=log) if target_format == "mxfp8" else None
