@@ -355,6 +355,20 @@ class StreamingSafeTensorWriter:
             raise RuntimeError(f"Safetensors header is too large: {aligned_size} bytes.")
         return struct.pack("<Q", aligned_size) + header_bytes
 
+    def abort(self):
+        if self._payload is not None:
+            try:
+                self._payload.close()
+            except OSError:
+                pass
+            self._payload = None
+        if self.payload_path and os.path.exists(self.payload_path):
+            try:
+                os.remove(self.payload_path)
+            except OSError as error:
+                self.log(f"Warning: could not remove temporary payload '{self.payload_path}': {error}")
+        self.payload_path = None
+
     def finalize(self, output_path, metadata):
         if self._payload is None:
             raise RuntimeError("Streaming safetensors writer is already closed.")
@@ -439,7 +453,11 @@ def _validate_saved_safetensors(path, tensors, metadata):
 def save_safetensors_atomic(tensors, output_path, metadata, log=_noop_logger):
     """Save atomically; large streaming outputs are written incrementally."""
     if isinstance(tensors, StreamingSafeTensorWriter):
-        tensors.finalize(output_path, metadata)
+        try:
+            tensors.finalize(output_path, metadata)
+        except Exception:
+            tensors.abort()
+            raise
         return
 
     output_dir = os.path.dirname(os.path.abspath(output_path))
