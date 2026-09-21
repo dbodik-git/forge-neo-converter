@@ -336,6 +336,19 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(preserved["sentinel"].item(), 7)
             self.assertFalse(any(name.endswith(".partial") for name in os.listdir(temp_dir)))
 
+    def test_streaming_writer_preserves_scalar_shape(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = os.path.join(temp_dir, "scalar.safetensors")
+            writer = core.StreamingSafeTensorWriter(output)
+            writer["scalar"] = torch.tensor(2.5, dtype=torch.float32)
+            writer.finalize(output, {"test": "scalar"})
+
+            with safetensors.safe_open(output, framework="pt", device="cpu") as handle:
+                tensor = handle.get_tensor("scalar")
+                self.assertEqual(tensor.shape, torch.Size([]))
+                self.assertEqual(tensor.dtype, torch.float32)
+                self.assertEqual(tensor.item(), 2.5)
+
     def test_streaming_save_failure_preserves_existing_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = os.path.join(temp_dir, "model-bf16.safetensors")
