@@ -336,7 +336,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(preserved["sentinel"].item(), 7)
             self.assertFalse(any(name.endswith(".partial") for name in os.listdir(temp_dir)))
 
-    def test_atomic_save_write_failure_preserves_existing_output(self):
+    def test_streaming_save_failure_preserves_existing_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = os.path.join(temp_dir, "model-bf16.safetensors")
             output = os.path.join(temp_dir, "model-fp16.safetensors")
@@ -351,8 +351,8 @@ class CoreTests(unittest.TestCase):
             )
 
             with mock.patch.object(
-                core.safetensors.torch,
-                "save_file",
+                core.StreamingSafeTensorWriter,
+                "finalize",
                 side_effect=OSError("disk full"),
             ):
                 with self.assertRaisesRegex(OSError, "disk full"):
