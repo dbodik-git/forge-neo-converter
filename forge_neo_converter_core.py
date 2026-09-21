@@ -326,7 +326,10 @@ class StreamingSafeTensorWriter:
 
         dtype_name = _safetensors_dtype_name(cpu_tensor.dtype)
         shape = [int(dim) for dim in cpu_tensor.shape]
-        byte_view = cpu_tensor.view(torch.uint8)
+        # torch.Tensor.view(dtype) requires at least one dimension when the
+        # element size changes. Safetensors also supports scalar (0-D) tensors,
+        # so flatten only the byte-level view; keep the original shape in metadata.
+        byte_view = cpu_tensor.reshape(-1).view(torch.uint8)
         data_view = memoryview(byte_view.numpy())
         begin = self.offset
         end = begin + data_view.nbytes
