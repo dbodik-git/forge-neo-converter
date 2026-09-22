@@ -297,19 +297,30 @@ def _safetensors_dtype_name(dtype):
 
 
 class StreamingSafeTensorWriter:
-    """Write tensors incrementally without retaining the converted state dict in RAM."""
+    """Write tensors incrementally without retaining the converted state dict in RAM.
 
-    COPY_CHUNK_SIZE = 8 * 1024 * 1024
+    The output file is created once. A fixed-size header reservation is placed at
+    the front, tensor payloads are streamed directly after it, and the final
+    SafeTensors header is written back in-place before the atomic rename. This
+    avoids the extra payload temp-file read/write pass used by the previous
+    implementation.
+    """
+
     MAX_HEADER_SIZE = 100_000_000
+    HEADER_RESERVE_SIZE = 16 * 1024 * 1024
 
     def __init__(self, output_path, log=_noop_logger):
         output_dir = os.path.dirname(os.path.abspath(output_path))
         output_name = os.path.basename(output_path)
-        self.payload_path = os.path.join(output_dir, f".{output_name}.payload.partial")
+        self.temp_path = os.path.join(output_dir, f".{output_name}.partial")
         self.entries = OrderedDict()
         self.offset = 0
         self.log = log
-        self._payload = open(self.payload_path, "wb")
+        self._output = open(self.temp_path, "w+b")
+        # The final header length includes all reserved bytes. The format allows
+        # trailing whitespace in the JSON header, so the reserved region can be
+        # filled with spaces after the real JSON has been built.
+        self._output.write(b"\\x00" * (8 + self.HEADER_RESERVE_SIZE))
 
     def __setitem__(self, key, tensor):
         if key in self.entries:
@@ -333,7 +344,7 @@ class StreamingSafeTensorWriter:
         data_view = memoryview(byte_view.numpy())
         begin = self.offset
         end = begin + data_view.nbytes
-        self._payload.write(data_view)
+        self._output.write(data_view)
         self.entries[key] = {
             "dtype": dtype_name,
             "shape": shape,
@@ -349,69 +360,70 @@ class StreamingSafeTensorWriter:
                 str(key): str(value) for key, value in metadata.items()
             }
         header.update(self.entries)
-        header_bytes = json.dumps(
+        header_json = json.dumps(
             header, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
-        aligned_size = (len(header_bytes) + 7) // 8 * 8
-        header_bytes += b" " * (aligned_size - len(header_bytes))
+        aligned_size = (len(header_json) + 7) // 8 * 8
+        if aligned_size > self.HEADER_RESERVE_SIZE:
+            raise RuntimeError(
+                f"Safetensors header needs {aligned_size} bytes, "
+                f"but only {self.HEADER_RESERVE_SIZE} bytes were reserved."
+            )
         if aligned_size > self.MAX_HEADER_SIZE:
             raise RuntimeError(f"Safetensors header is too large: {aligned_size} bytes.")
-        return struct.pack("<Q", aligned_size) + header_bytes
+        # The declared header size is the entire reserved region. The remainder
+        # is valid JSON whitespace padding, so the byte-buffer starts exactly
+        # where the streamed tensor payload already begins.
+        padded_header = header_json + b" " * (self.HEADER_RESERVE_SIZE - len(header_json))
+        return struct.pack("<Q", self.HEADER_RESERVE_SIZE) + padded_header
 
     def abort(self):
-        if self._payload is not None:
+        if self._output is not None:
             try:
-                self._payload.close()
+                self._output.close()
             except OSError:
                 pass
-            self._payload = None
-        if self.payload_path and os.path.exists(self.payload_path):
+            self._output = None
+        if self.temp_path and os.path.exists(self.temp_path):
             try:
-                os.remove(self.payload_path)
+                os.remove(self.temp_path)
             except OSError as error:
-                self.log(f"Warning: could not remove temporary payload '{self.payload_path}': {error}")
-        self.payload_path = None
+                self.log(f"Warning: could not remove temporary output '{self.temp_path}': {error}")
+        self.temp_path = None
 
     def finalize(self, output_path, metadata):
-        if self._payload is None:
+        if self._output is None:
             raise RuntimeError("Streaming safetensors writer is already closed.")
-        self._payload.flush()
-        self._payload.close()
-        self._payload = None
-        output_dir = os.path.dirname(os.path.abspath(output_path))
-        output_name = os.path.basename(output_path)
-        temp_path = os.path.join(output_dir, f".{output_name}.partial")
         try:
             header = self._build_header(metadata)
             self.log(
-                f"Finalizing streaming output: {output_name} "
-                f"({len(self.entries)} tensors, {self.offset} payload bytes)"
+                f"Finalizing streaming output: {os.path.basename(output_path)} "
+                f"({len(self.entries)} tensors, {self.offset} payload bytes, "
+                f"one-pass disk write)"
             )
-            with open(temp_path, "wb") as destination:
-                destination.write(header)
-                with open(self.payload_path, "rb") as payload:
-                    while True:
-                        chunk = payload.read(self.COPY_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        destination.write(chunk)
-                destination.flush()
-                os.fsync(destination.fileno())
-            _validate_saved_safetensors(temp_path, self, metadata)
-            os.replace(temp_path, output_path)
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError as error:
-                    self.log(f"Warning: could not remove temporary output '{temp_path}': {error}")
-            if self.payload_path and os.path.exists(self.payload_path):
-                try:
-                    os.remove(self.payload_path)
-                except OSError as error:
-                    self.log(f"Warning: could not remove temporary payload '{self.payload_path}': {error}")
-            self.payload_path = None
+            self._output.flush()
+            self._output.seek(0)
+            self._output.write(header)
+            self._output.flush()
+            os.fsync(self._output.fileno())
+            self._output.close()
+            self._output = None
 
+            _validate_saved_safetensors(self.temp_path, self, metadata)
+            os.replace(self.temp_path, output_path)
+        finally:
+            if self._output is not None:
+                try:
+                    self._output.close()
+                except OSError:
+                    pass
+                self._output = None
+            if self.temp_path and os.path.exists(self.temp_path):
+                try:
+                    os.remove(self.temp_path)
+                except OSError as error:
+                    self.log(f"Warning: could not remove temporary output '{self.temp_path}': {error}")
+            self.temp_path = None
 
 def _validate_saved_safetensors(path, tensors, metadata):
     if os.path.getsize(path) <= 0:
