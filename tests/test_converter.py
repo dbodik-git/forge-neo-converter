@@ -349,6 +349,31 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(tensor.dtype, torch.float32)
                 self.assertEqual(tensor.item(), 2.5)
 
+    def test_streaming_writer_uses_single_output_file_and_reserved_header(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = os.path.join(temp_dir, "one-pass.safetensors")
+            writer = core.StreamingSafeTensorWriter(output)
+            writer["weight"] = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+            writer["scalar"] = torch.tensor(2.5, dtype=torch.float32)
+            writer.finalize(output, {"test": "one-pass"})
+
+            self.assertEqual(
+                os.path.getsize(output),
+                8 + writer.HEADER_RESERVE_SIZE + 16 * 4 + 4,
+            )
+            with open(output, "rb") as handle:
+                header_size = int.from_bytes(handle.read(8), "little")
+                self.assertEqual(header_size, writer.HEADER_RESERVE_SIZE)
+                handle.seek(8 + header_size + 16 * 4)
+                self.assertEqual(handle.read(4), torch.tensor(2.5, dtype=torch.float32).numpy().tobytes())
+
+            with safetensors.safe_open(output, framework="pt", device="cpu") as handle:
+                self.assertEqual(handle.get_tensor("weight").shape, torch.Size([4, 4]))
+                self.assertEqual(handle.get_tensor("scalar").shape, torch.Size([]))
+                self.assertEqual(handle.metadata(), {"test": "one-pass"})
+
+            self.assertFalse(any(name.endswith(".partial") for name in os.listdir(temp_dir)))
+
     def test_streaming_save_failure_preserves_existing_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = os.path.join(temp_dir, "model-bf16.safetensors")
