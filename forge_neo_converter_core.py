@@ -320,7 +320,7 @@ class StreamingSafeTensorWriter:
         # The final header length includes all reserved bytes. The format allows
         # trailing whitespace in the JSON header, so the reserved region can be
         # filled with spaces after the real JSON has been built.
-        self._output.write(b"\\x00" * (8 + self.HEADER_RESERVE_SIZE))
+        self._output.write(b"\x00" * (8 + self.HEADER_RESERVE_SIZE))
 
     def __setitem__(self, key, tensor):
         if key in self.entries:
