@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import struct
 import tempfile
 import time
 from collections import Counter, OrderedDict
@@ -75,6 +76,33 @@ if hasattr(torch, "float8_e4m3fn"):
     DTYPE_NAMES[torch.float8_e4m3fn] = "fp8_e4m3fn"
 if hasattr(torch, "float8_e5m2"):
     DTYPE_NAMES[torch.float8_e5m2] = "fp8_e5m2"
+
+
+def _safetensors_dtype_name(dtype):
+    """Return the canonical SafeTensors dtype code for a torch dtype."""
+    names = {
+        torch.float64: "F64",
+        torch.float32: "F32",
+        torch.float16: "F16",
+        torch.bfloat16: "BF16",
+        torch.int64: "I64",
+        torch.int32: "I32",
+        torch.int16: "I16",
+        torch.int8: "I8",
+        torch.uint8: "U8",
+        torch.bool: "BOOL",
+        torch.complex64: "C64",
+    }
+    float8_e4m3fn = getattr(torch, "float8_e4m3fn", None)
+    float8_e5m2 = getattr(torch, "float8_e5m2", None)
+    if float8_e4m3fn is not None:
+        names[float8_e4m3fn] = "F8_E4M3"
+    if float8_e5m2 is not None:
+        names[float8_e5m2] = "F8_E5M2"
+    try:
+        return names[dtype]
+    except KeyError as error:
+        raise ValueError(f"Unsupported SafeTensors dtype: {dtype}") from error
 
 
 @dataclass
