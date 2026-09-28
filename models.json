@@ -2,7 +2,12 @@
   "default": {
     "blacklist": ["cap_embedder", "x_embedder", "noise_refiner", "context_refiner", "t_embedder", "final_layer"],
     "fp8_layers": [],
-    "preserve_extended_metadata": false
+    "preserve_extended_metadata": false,
+      "target_overrides": {
+        "int8_convrot": {"blacklist_remove": ["proj_out"]},
+        "int4_convrot": {"blacklist_remove": ["proj_out"]},
+        "w4a8_convrot": {"blacklist_remove": ["proj_out"]}
+      }
   },
   "models": {
     "ACE-Step": {
